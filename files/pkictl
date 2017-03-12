@@ -1,0 +1,910 @@
+#!/bin/bash
+##----------------
+##Name: pkictl
+##Description: A biased controller script to aid in common openssl management
+##             tasks
+##Date: 2015.03.02-00:03
+##Version: 0.10.0-beta
+##Requirements: openssl
+##----------------
+
+# Load configuration files
+if [[ -f ${PKICTL_CONF} ]]; then
+  source ${PKICTL_CONF}
+elif [[ -f ${PWD}/pkictl.conf ]]; then
+  source ${PWD}/pkictl.conf
+elif [[ -f ${XDG_CONFIG_HOME}/pkictl.conf ]]; then
+  source ${XDG_CONFIG_HOME}/pkictl.conf
+elif [[ -f ${HOME}/.pkictl.conf ]]; then
+  source ${HOME}/.pkictl.conf
+elif [[ -f /etc/pkictl/pkictl.conf ]]; then
+  source /etc/pkictl/pkictl.conf
+fi
+
+# Binary settings
+export OPENSSL_BIN=${OPENSSL_BIN:-"openssl"}
+
+# CA settings
+export PKICTL_ORG=${PKICTL_ORG:-"myorg.local"}  # Same as organizationName used in *.conf files
+
+# Script settings
+export PKICTL_CONFIG_DIR=${PKICTL_CONFIG_DIR:-$PWD/config}
+export PKICTL_CA_DIR=${PKICTL_CA_DIR:-$PWD/certs}
+export PKICTL_SSL_DIR=${PKICTL_SSL_DIR:-/etc/ssl}
+export PKICTL_CLIENTCERTS_DIR=${PKICTL_CLIENTCERTS_DIR:-/etc/ssl/certs}
+export PKICTL_IMPORT_DIR=${PKICTL_IMPORT_DIR:-$PWD/import}
+export PKICTL_SAFE_TEST=${PKICTL_SAFE_TEST:-"false"}
+export PKICTL_BATCH=${PKICTL_BATCH:-"false"}
+
+# OS settings
+export PKICTL_UPDATE_CERTS_CMD=$(command -v update-ca-certificates)
+export PKICTL_IMPORT_GROUP=${PKICTL_IMPORT_GROUP:-"ssl-cert"}
+export PKICTL_IMPORT_USER=${PKICTL_IMPORT_USER:-"root"}
+
+# Depending on location and distro, certs need "pem" or "crt" suffix to be
+# recognized by update-ca-certificates
+case "$PKICTL_CLIENTCERTS_DIR" in
+    /etc/ssl/certs)
+        declare CERT_EXT="pem"
+        ;;
+    *)
+        declare CERT_EXT="crt"
+        ;;
+esac
+
+##############################################################################
+## Setup
+##############################################################################
+
+init_ca_folders() {
+    if [[ -d "$caPath" ]]; then
+        echo "Cannot init new CA with existing filename. Aborting."
+        exit 1
+    fi
+    mkdir -p "${caPath}/private" "${caPath}/db" "${caPath}/crl" "${caPath}/certs"
+    chmod 700 "${caPath}/private"
+}
+
+init_ca_db() {
+    cp /dev/null "${caPath}/db/${caName}.db"
+    cp /dev/null "${caPath}/db/${caName}.db.attr"
+    echo 01 > "${caPath}/db/${caName}.crt.srl"
+    echo 01 > "${caPath}/db/${caName}.crl.srl"
+}
+
+init_import_folders() {
+    mkdir -p \
+        "${sslClientPath}/certs"
+    mkdir -p -m 710 \
+        "${sslClientPath}/private" \
+        "${sslClientPath}/private/${PKICTL_IMPORT_GROUP}"
+    if [[ "$PKICTL_SAFE_TEST" == "false" ]]; then
+        sudo chown root:ssl-cert "${sslClientPath}/private"
+        sudo chown root:"${PKICTL_IMPORT_GROUP}" "${sslClientPath}/private/${PKICTL_IMPORT_GROUP}"
+    else
+        echo "test mode enabled: skipped change ownership of private key folders."
+    fi
+}
+
+##############################################################################
+## Openssl commands
+##############################################################################
+
+gen_request() {
+    declare csrName=${eeName:-"$caName"}
+    if [[ "$isEecert" == true ]]; then
+        declare outCsr="${caPath}/export/${csrName}.csr"
+    else
+        declare outCsr="${caPath}/${csrName}.csr"
+    fi
+    if [[ "$PKICTL_BATCH" == "true" ]]; then
+      opensslOpt="-batch ${opensslOpt}"
+    fi
+    $OPENSSL_BIN req -new ${opensslOpt}\
+        -config "$conf" \
+        -out "$outCsr" \
+        -keyout "${caPath}/private/${csrName}.key"
+    chmod 700 "${caPath}/private/${csrName}.key"
+}
+
+sign_root_ca_request() {
+    declare csrName="$caName"
+    declare outName="$caName"
+
+    if [[ "$PKICTL_BATCH" == "true" ]]; then
+      opensslOpt="-batch ${opensslOpt}"
+    fi
+
+    if [[ "$PKICTL_CA_EXTENSIONS" == "" ]] && [[ "$PKICTL_CA_POLICY" == "" ]]; then
+        $OPENSSL_BIN ca ${opensslOpt} -selfsign \
+            -config "$conf" \
+            -in "${caPath}/${csrName}.csr" \
+            -out "${caPath}/${outName}.crt"
+    elif [[ "$PKICTL_CA_EXTENSIONS" != "" ]] && [[ "$PKICTL_CA_POLICY" == "" ]]; then
+        $OPENSSL_BIN ca ${opensslOpt} -selfsign \
+            -config "$conf" \
+            -in "${caPath}/${csrName}.csr" \
+            -out "${caPath}/${outName}.crt" \
+            -extensions "$PKICTL_CA_EXTENSIONS"
+    elif [[ "$PKICTL_CA_EXTENSIONS" == "" ]] && [[ "$PKICTL_CA_POLICY" != "" ]]; then
+        $OPENSSL_BIN ca ${opensslOpt} -selfsign \
+            -config "$conf" \
+            -in "${caPath}/${csrName}.csr" \
+            -out "${caPath}/${outName}.crt" \
+            -policy "$PKICTL_CA_POLICY"
+    else
+        $OPENSSL_BIN ca ${opensslOpt} -selfsign \
+            -config "$conf" \
+            -in "${caPath}/${csrName}.csr" \
+            -out "${caPath}/${outName}.crt" \
+            -policy "$PKICTL_CA_POLICY" \
+            -extensions "$PKICTL_CA_EXTENSIONS"
+    fi
+
+    if [[ "$?" -eq 0 ]]; then
+        rm "${caPath}/${csrName}.csr"
+    fi
+}
+
+sign_request() {
+    declare csrName=${csrName:-"$caName"}
+    declare outName=${csrName:-"$caName"}
+    if [[ "$isEecert" == true ]]; then
+        declare inCsr="${caPath}/export/${csrName}.csr"
+        declare outCrt="${caPath}/export/${outName}.crt"
+    else
+        declare inCsr="${caPath}/${csrName}.csr"
+        declare outCrt="${caPath}/${outName}.crt"
+    fi
+    if [[ "$PKICTL_BATCH" == "true" ]]; then
+      opensslOpt="-batch ${opensslOpt}"
+    fi
+    if [[ "$PKICTL_CA_EXTENSIONS" == "" ]] && [[ "$PKICTL_CA_POLICY" == "" ]]; then
+        $OPENSSL_BIN ca ${opensslOpt}\
+            -config "$conf" \
+            -in "$inCsr" \
+            -out "$outCrt"
+    elif [[ "$PKICTL_CA_EXTENSIONS" != "" ]] && [[ "$PKICTL_CA_POLICY" == "" ]]; then
+        $OPENSSL_BIN ca ${opensslOpt}\
+            -config "$conf" \
+            -in "$inCsr" \
+            -out "$outCrt" \
+            -extensions "$PKICTL_CA_EXTENSIONS"
+    elif [[ "$PKICTL_CA_EXTENSIONS" == "" ]] && [[ "$PKICTL_CA_POLICY" != "" ]]; then
+        $OPENSSL_BIN ca ${opensslOpt}\
+            -config "$conf" \
+            -in "$inCsr" \
+            -out "$outCrt" \
+            -policy "$PKICTL_CA_POLICY"
+    else
+        $OPENSSL_BIN ca ${opensslOpt}\
+            -config "$conf" \
+            -in "$inCsr" \
+            -out "$outCrt" \
+            -policy "$PKICTL_CA_POLICY" \
+            -extensions "$PKICTL_CA_EXTENSIONS"
+    fi
+
+    if [[ "$?" -eq 0 ]]; then
+        rm "$inCsr"
+    fi
+}
+
+gen_crl() {
+    if [[ "$PKICTL_BATCH" == "true" ]]; then
+      opensslOpt="-batch ${opensslOpt}"
+    fi
+    $OPENSSL_BIN ca -gencrl ${opensslOpt}\
+        -config "$conf" \
+        -out "${caPath}/crl/${caName}.crl"
+}
+
+gen_pem() {
+    cat "${subCert}" "${parentCert}" > \
+        "${caPath}/${PKICTL_ORG}-${subCaLabel}.chain.pem"
+}
+
+gen_pkcs12() {
+    if [[ "$isEecert" == true ]]; then
+        declare inCrt="${caPath}/export/${csrName}.crt"
+        declare outP12="${caPath}/export/${eeName}.ee.p12"
+    else
+        declare inCrt="${caPath}/${csrName}.crt"
+        declare outP12="${caPath}/${eeName}.ee.p12"
+    fi
+    $OPENSSL_BIN pkcs12 -export \
+        -name "${outputLabel}" \
+        -inkey "${caPath}/private/${csrName}.key" \
+        -in "$inCrt" \
+        -certfile "${caPath}/${PKICTL_ORG}-${signingCaLabel}.chain.pem" \
+        -out "$outP12"
+}
+
+revoke_cert() {
+    export PKICTL_CRL_REASON=${PKICTL_CRL_REASON:-"unspecified"}
+    declare revokeName=${csrName:-"$caName"}
+    if [[ "$isEecert" == true ]]; then
+        declare revokeCrt="${caPath}/export/${revokeName}.crt"
+    else
+        declare revokeCrt="${caPath}/${revokeName}.crt"
+    fi
+    if [[ "$PKICTL_BATCH" == "true" ]]; then
+      opensslOpt="-batch ${opensslOpt}"
+    fi
+    $OPENSSL_BIN ca ${opensslOpt}\
+        -config "$conf" \
+        -revoke "$revokeCrt" \
+        -crl_reason "$PKICTL_CRL_REASON"
+}
+
+##############################################################################
+## Import Commands
+##############################################################################
+
+extract_org_names() {
+    $OPENSSL_BIN pkcs12 \
+        -in "${PKICTL_IMPORT_DIR}/${importFileLabel}.ee.p12" \
+        -out "/tmp/${importFileLabel}.ee.crt" \
+        -nodes \
+        -clcerts \
+        -nokeys \
+        -passin pass:"${PKICTL_PKCS12_PASS}"
+
+    export PKICTL_IMPORT_ORG_NAME=$($OPENSSL_BIN x509 -in "/tmp/${importFileLabel}.ee.crt" -noout -subject | awk -F 'O=' '{print $2}' | awk -F '/' '{print $1}' | sed 's/[* ]/_/g')
+    # export PKICTL_IMPORT_COMMON_NAME=$($OPENSSL_BIN x509 -in "/tmp/${importFileLabel}.ee.crt" -noout -subject | awk -F 'CN=' '{print $2}' | awk -F '/' '{print $1}' | sed 's/[* ]/_/g')
+    rm "/tmp/${importFileLabel}.ee.crt"
+}
+
+extract_full_chain() {
+    declare inFile="${PKICTL_IMPORT_DIR}/${importFileLabel}.ee.p12"
+    declare outFileName="${sslClientPath}/${PKICTL_IMPORT_ORG_NAME}-${importFileLabel}-chain"
+    declare outFileSuffix="pem"
+    declare countMax=0
+    declare outFile=""
+    exist_check
+    $OPENSSL_BIN pkcs12 \
+        -in "$inFile" \
+        -out "$outFile" \
+        -nodes \
+        -nokeys \
+        -passin pass:"${PKICTL_PKCS12_PASS}"
+    strip_headers "$outFile"
+    dupe_check
+}
+
+extract_ee_key() {
+    declare inFile="${PKICTL_IMPORT_DIR}/${importFileLabel}.ee.p12"
+    declare exportKey="${importFileLabel}.ee"
+    declare outFileName="${sslClientPath}/private/${PKICTL_IMPORT_GROUP}/${exportKey}"
+    declare outFileSuffix="key"
+    declare countMax=0
+    declare outFile=""
+    exist_check
+    $OPENSSL_BIN pkcs12 \
+        -in "$inFile" \
+        -out "$outFile" \
+        -nodes \
+        -nocerts \
+        -passin pass:"${PKICTL_PKCS12_PASS}"
+    if [[ "$PKICTL_SAFE_TEST" == "false" ]]; then
+        sudo chmod 640 "$outFile"
+        sudo chown root:"${PKICTL_IMPORT_GROUP}" "$outFile"
+    else
+        chmod 640 "$outFile"
+        echo "test mode enabled: skipped change ownership of private key."
+    fi
+    strip_headers "$outFile"
+    dupe_check
+}
+
+extract_ee_cert(){
+    declare inFile="${PKICTL_IMPORT_DIR}/${importFileLabel}.ee.p12"
+    declare outFileName="${sslClientPath}/certs/${PKICTL_IMPORT_ORG_NAME}-${importFileLabel}"
+    declare outFileSuffix="crt"
+    declare countMax=0
+    declare outFile=""
+    exist_check
+    $OPENSSL_BIN pkcs12 \
+        -in "$inFile" \
+        -out "$outFile" \
+        -nodes \
+        -clcerts \
+        -nokeys \
+        -passin pass:"${PKICTL_PKCS12_PASS}"
+    strip_headers "$outFile"
+    dupe_check
+}
+
+extract_intermediate_chain() {
+    declare inFile="${PKICTL_IMPORT_DIR}/${importFileLabel}.ee.p12"
+    declare outFileName="${sslClientPath}/${PKICTL_IMPORT_ORG_NAME}-${importFileLabel}-intermediates"
+    declare outFileSuffix="pem"
+    declare countMax=0
+    declare outFile=""
+    exist_check
+    $OPENSSL_BIN pkcs12 \
+        -in "$inFile" \
+        -out "$outFile" \
+        -nodes \
+        -cacerts \
+        -nokeys \
+        -passin pass:"${PKICTL_PKCS12_PASS}"
+    strip_headers "$outFile"
+    dupe_check
+    intermediate_dupe_check
+}
+
+split_pem() {
+    declare chainFile="${sslClientPath}/${PKICTL_IMPORT_ORG_NAME}-${importFileLabel}-intermediates.pem"
+    if [[ -e "$chainFile" ]]; then
+        mkdir "${sslClientPath}/tmp"
+        cd "${sslClientPath}/tmp"
+        strip_headers "$chainFile"
+        cat "$chainFile" \
+            | awk \
+                'split_after==1{n++;split_after=0}\
+                /-----END CERTIFICATE-----/\
+                {split_after=1}\
+                {print > "cert" n ".crt"}'
+        for cert in *; do
+            [[ -e "$cert" ]] || continue
+
+            declare newName=$($OPENSSL_BIN x509 -in "$cert" -noout -subject | awk -F 'CN=' '{print $2}' | awk -F '/' '{print $1}' | sed 's/[* ]/_/g')
+
+            declare outFileName="${sslClientPath}/certs/${newName}"
+            declare outFileSuffix="${CERT_EXT}"
+            declare countMax=0
+            declare outFile=""
+
+            exist_check
+            mv "$cert" "${outFile}"
+            dupe_check
+        done
+        rmdir "${sslClientPath}/tmp"
+    fi
+}
+
+install_certs() {
+    if [[ -d "${PKICTL_CLIENTCERTS_DIR}" ]]; then
+        if [[ -w "${PKICTL_CLIENTCERTS_DIR}" ]]; then
+            for cert in "${sslClientPath}/certs/"*; do
+                [[ -e "$cert" ]] || continue
+                ln -sf "$cert" "${PKICTL_CLIENTCERTS_DIR}"
+            done
+        else
+            for cert in "${sslClientPath}/certs/"*; do
+                [[ -e "$cert" ]] || continue
+                if [[ "$PKICTL_SAFE_TEST" == "false" ]]; then
+                    sudo ln -sf "$cert" "${PKICTL_CLIENTCERTS_DIR}"
+                else
+                    ln -sf "$cert" "${PKICTL_CLIENTCERTS_DIR}"
+                    echo "test mode enabled: symlinked certs made as current user"
+                fi
+            done
+        fi
+
+        if [[ "$PKICTL_SAFE_TEST" == "false" ]]; then
+            sudo $PKICTL_UPDATE_CERTS_CMD
+        else
+            echo "test mode enabled: skipped 'update-ca-certificates'"
+        fi
+    else
+        echo "error: $PKICTL_CLIENTCERTS_DIR not found. This directory should already exist and be expected by the 'update-ca-certificates' command."
+        exit 1
+    fi
+}
+
+exist_check() {
+    declare previousFileName="${outFileName}"
+    if [[ -f "${outFileName}.${outFileSuffix}" ]]; then
+        declare i=0
+        declare previousFileCounter=0
+        while [[ -f "${outFileName}.${i}.${outFileSuffix}" ]]; do
+            previousFileCounter="$i"
+            previousFileName="${outFileName}.${previousFileCounter}"
+            i=$((i + 1))
+        done
+        declare outFileNameCounter="${outFileName}.${i}"
+        countMax="$previousFileCounter"
+        previousFile="${previousFileName}.${outFileSuffix}"
+        outFile="${outFileNameCounter}.${outFileSuffix}"
+    else
+        previousFile="/dev/null"
+        outFile="${outFileName}.${outFileSuffix}"
+    fi
+}
+
+dupe_check() {
+    declare i=$countMax
+    if [[ "$i" -eq -1 ]]; then
+        declare counterSuffix="${outFileSuffix}"
+    else
+        declare counterSuffix="${i}.${outFileSuffix}"
+    fi
+    while [[ -f "${outFileName}.${counterSuffix}" ]]; do
+        case "$outFileSuffix" in
+            crt)
+                declare previousFileFingerprint=$($OPENSSL_BIN x509 -in "$previousFile" -noout -fingerprint | awk -F '=' '{print $2}')
+                declare outFileFingerprint=$($OPENSSL_BIN x509 -in "$outFile" -noout -fingerprint | awk -F '=' '{print $2}')
+                if [[ "$previousFileFingerprint" == "$outFileFingerprint" ]]; then
+                    rm -rf "$outFile"
+                    break
+                fi
+                ;;
+            *)
+                declare previousFileMd5=$(md5sum "$previousFile" | awk '{print $1}')
+                declare outFileMd5=$(md5sum "$outFile" | awk '{print $1}')
+                if [[ "$previousFileMd5" == "$outFileMd5" ]]; then
+                    rm -rf "$outFile"
+                    break
+                fi
+                ;;
+        esac
+
+        i=$((i - 1))
+        counterSuffix="${i}.${outFileSuffix}"
+        if [[ "$i" -eq -1 ]]; then
+            counterSuffix="${outFileSuffix}"
+        elif [[ "$i" -lt 0 ]]; then
+            break
+        fi
+        previousFile="${outFileName}.${counterSuffix}"
+    done
+}
+
+intermediate_dupe_check(){
+    declare checkFile=""
+    if [[ "$previousFile" == "/dev/null" ]]; then
+        checkFile=$outFile
+    else
+        checkFile=$previousFile
+    fi
+    declare checkFileMd5=$(md5sum "$checkFile" | awk '{print $1}')
+    for i_cert in "${sslClientPath}"/*intermediates*; do
+        [[ -e "$i_cert" ]] && [[ ! "$i_cert" == "$checkFile" ]] || continue
+        declare i_certMd5=$(md5sum "$i_cert" | awk '{print $1}')
+        if [[ "$i_certMd5" == "$checkFileMd5" ]]; then
+            rm -rf "$checkFile"
+        fi
+    done
+}
+
+pkey_group_prep() {
+    if [[ $(getent group ssl-cert) ]]; then
+        echo "System group 'ssl-cert' already exists, continuing..."
+    elif [[ "$PKICTL_SAFE_TEST" == "false" ]]; then
+        sudo groupadd --system ssl-cert &&\
+            echo "Created system group 'ssl-cert'"
+    else
+        echo "test mode enabled: skipped creation of group 'ssl-cert'"
+    fi
+    if [[ ! $(getent group "$PKICTL_IMPORT_GROUP") ]]; then
+        echo "Error: group $PKICTL_IMPORT_GROUP doesn't exist."
+        echo "Make sure this system is configured with this group first."
+        exit 1
+    elif [[ ! $(id -u "$PKICTL_IMPORT_USER") ]]; then
+        echo "Error: user $PKICTL_IMPORT_USER doesn't exist."
+        echo "Make sure this system is configured with this user first."
+        exit 1
+    elif [[ ! "$PKICTL_IMPORT_USER" == "root" ]] && [[ "$PKICTL_SAFE_TEST" == "false" ]]; then
+        sudo usermod -a -G ssl-cert "$PKICTL_IMPORT_USER" &&\
+        echo "User $PKICTL_IMPORT_USER added to group 'ssl-cert'"
+    fi
+}
+
+strip_headers() {
+    declare stripFile="$1"
+    # Remove top header
+    sed -i '0,/^-----BEGIN/{//!d}' $stripFile
+    # Remove inner headers
+    sed -i '/^-----END/,/^-----BEGIN/{//!d}' $stripFile
+}
+
+##############################################################################
+## CLI Commands
+##############################################################################
+
+rootca() {
+    declare action="$1"
+    declare caCertDepth="root"
+    declare caName="${PKICTL_ORG}-${caCertDepth}.ca"
+    declare caPath="${PKICTL_CA_DIR}/${caName}"
+    declare conf="${PKICTL_CONFIG_DIR}/${caName}.conf"
+
+    case "$action" in
+        init)
+            init_ca_folders
+            init_ca_db
+            ;;
+        request)
+            gen_request
+            ;;
+        sign)
+            export PKICTL_CA_POLICY=${PKICTL_CA_POLICY:-""}
+            export PKICTL_CA_EXTENSIONS=${PKICTL_CA_EXTENSIONS:-"root_ca_ext"}
+            sign_root_ca_request
+            ;;
+        gencrl)
+            gen_crl
+            ;;
+        help)
+            display_usage_rootca
+            ;;
+        *)
+            echo "argument error: missing or incorrect action."
+            echo ""
+            display_usage_rootca
+            ;;
+    esac
+}
+
+subca() {
+    declare action="$1"
+    declare subCaLabel="$2"
+    declare signingCaLabel="$3"
+    if [[ "$subCaLabel" == "" ]]; then
+        echo "argument error: <subca label> field required."
+        echo ""
+        display_usage_subca
+    fi
+    declare caName="${PKICTL_ORG}-${subCaLabel}.root.ca"
+    declare caPath="${PKICTL_CA_DIR}/${caName}"
+    declare conf="${PKICTL_CONFIG_DIR}/${caName}.conf"
+
+    case "$action" in
+        init)
+            init_ca_folders
+            init_ca_db
+            ;;
+        request)
+            gen_request
+            ;;
+        sign)
+            if [[ "$signingCaLabel" == "" ]]; then
+                echo "argument error: <signing CA label> field required."
+                echo ""
+                display_usage_subca
+            elif [[ "$signingCaLabel" == "root" ]]; then
+                declare conf="${PKICTL_CONFIG_DIR}/${PKICTL_ORG}-root.ca.conf"
+            else
+                declare conf="${PKICTL_CONFIG_DIR}/${PKICTL_ORG}-${signingCaLabel}.root.ca.conf"
+            fi
+            export PKICTL_CA_POLICY=${PKICTL_CA_POLICY:-""}
+            export PKICTL_CA_EXTENSIONS=${PKICTL_CA_EXTENSIONS:-""}
+            sign_request
+            ;;
+        gencrl)
+            gen_crl
+            ;;
+        genpem)
+            if [[ "$signingCaLabel" == "" ]]; then
+                echo "argument error: <signing CA label> field required."
+                echo ""
+                display_usage_subca
+            elif [[ "$signingCaLabel" == "root" ]]; then
+                declare caName="${PKICTL_ORG}-root.ca"
+                declare parentCert="${PKICTL_CA_DIR}/${caName}/${caName}.crt"
+            else
+                declare caName="${PKICTL_ORG}-${signingCaLabel}"
+                declare parentCert="${PKICTL_CA_DIR}/${caName}.root.ca/${caName}.chain.pem"
+            fi
+            declare subCert="${caPath}/${PKICTL_ORG}-${subCaLabel}.root.ca.crt"
+            gen_pem
+            ;;
+        revoke)
+            if [[ "$signingCaLabel" == "" ]]; then
+                echo "argument error: <signing CA label> field required."
+                echo ""
+                display_usage_subca
+            elif [[ "$signingCaLabel" == "root" ]]; then
+                declare conf="${PKICTL_CONFIG_DIR}/${PKICTL_ORG}-${signingCaLabel}.ca.conf"
+            else
+                declare conf="${PKICTL_CONFIG_DIR}/${PKICTL_ORG}-${signingCaLabel}.root.ca.conf"
+            fi
+            revoke_cert
+            if [[ "$signingCaLabel" == "root" ]]; then
+                declare caName="${PKICTL_ORG}-${signingCaLabel}.ca"
+            else
+                declare caName="${PKICTL_ORG}-${signingCaLabel}.root.ca"
+            fi
+            declare caPath="${PKICTL_CA_DIR}/${caName}"
+            echo "Regenerating CRL..."
+            gen_crl
+            ;;
+        help)
+            display_usage_subca
+            ;;
+        *)
+            echo "argument error: missing or incorrect action."
+            echo ""
+            display_usage_subca
+            ;;
+    esac
+}
+
+eecert() {
+    declare action="$1"
+    declare requestLabel="$2"
+    declare signingCaLabel="$3"
+    declare outputLabel=${4:-$requestLabel}
+
+    eecert_arg_check() {
+        if [[ "$requestLabel" == "" ]] || [[ "$outputLabel" == "" ]]; then
+            echo "argument error: <request label>, <signing CA label>, and <output label> fields required."
+            echo ""
+            display_usage_eecert
+        fi
+    }
+
+    declare csrName="${PKICTL_ORG}-${requestLabel}.root.ee"
+    declare eeName="${PKICTL_ORG}-${outputLabel}.root.ee"
+    declare caPath="${PKICTL_CA_DIR}/${PKICTL_ORG}-${signingCaLabel}.root.ca"
+    declare isEecert=true
+
+    case "$action" in
+        request)
+            eecert_arg_check
+            mkdir -p "${caPath}/export"
+            declare conf="${PKICTL_CONFIG_DIR}/${PKICTL_ORG}-${requestLabel}.root.ee.conf"
+            gen_request
+            ;;
+        sign)
+            eecert_arg_check
+            mkdir -p "${caPath}/export"
+            declare conf="${PKICTL_CONFIG_DIR}/${PKICTL_ORG}-${signingCaLabel}.root.ca.conf"
+            export PKICTL_CA_POLICY=${PKICTL_CA_POLICY:-""}
+            export PKICTL_CA_EXTENSIONS=${PKICTL_CA_EXTENSIONS:-""}
+            sign_request
+            ;;
+        genpkcs12)
+            declare eeName="${outputLabel}"
+            eecert_arg_check
+            mkdir -p "${caPath}/export"
+            gen_pkcs12
+            ;;
+        revoke)
+            eecert_arg_check
+            declare conf="${PKICTL_CONFIG_DIR}/${PKICTL_ORG}-${signingCaLabel}.root.ca.conf"
+            revoke_cert
+            declare caName="${PKICTL_ORG}-${signingCaLabel}.root.ca"
+            declare caPath="${PKICTL_CA_DIR}/${caName}"
+            echo "Regenerating CRL..."
+            gen_crl
+            ;;
+        import)
+            declare importFileLabel="${requestLabel}"
+            extract_org_names
+            declare sslClientPath="${PKICTL_SSL_DIR}/${PKICTL_IMPORT_ORG_NAME}"
+            pkey_group_prep
+            init_import_folders
+            extract_full_chain
+            extract_ee_key
+            extract_ee_cert
+            extract_intermediate_chain
+            split_pem
+            install_certs
+            ;;
+        help)
+            display_usage_eecert
+            ;;
+        *)
+            echo "argument error: missing or incorrect action."
+            echo ""
+            display_usage_eecert
+            ;;
+    esac
+}
+
+##############################################################################
+## Usage Info
+##############################################################################
+
+display_usage_main() {
+    cat <<EOF
+Usage: pkictl [<organisation>] <subcommand> <action> <action args>
+
+Pkictl is a biased Public Key Infrastructure (PKI) management helper tool.
+It's designed to make certificate, key creation, and management tasks formal,
+easy to initiate, and easy to automate. The complexities of the openssl
+settings are to be absorbed by the various openssl.conf files, saving only
+execution of the tasks for the script itself.
+
+Subcommands:    Actions/Comments:
+    [<organisation>]
+                Define the orgnisation to work with.
+
+    rootca
+                (init|request|sign|gencrl|help)
+
+    subca
+                (init|request|sign|gencrl|genpem|revoke|help)
+                <subca label>
+                [<signing CA label>]
+
+    eecert
+                (request|sign|genpkcs12|revoke|import|help)
+                (<request label>|<end entity label>|<export name>)
+                <signing CA label>
+                [<output label>|<export name>]
+
+    help
+EOF
+    exit 1
+}
+
+display_usage_rootca() {
+    cat <<EOF
+Usage: pkictl [<organisation>] rootca <action>
+
+Create a root private key, CSR, and self sign to make a root CA.
+
+actions:
+    init
+            Create folder structure.
+
+    request
+            Create private key and certificate request.
+
+    sign
+            Self sign root CSR with root private key.
+
+    gencrl
+            Generate initial CRL file.
+EOF
+    exit 1
+}
+
+display_usage_subca() {
+    cat <<EOF
+Usage: pkictl [<organisation>] subca <action> <subca label> [<signing CA label>]
+
+Create a subordinate private key, CSR, certificate, and CRL named <subca label>
+and sign it with senior CA named <signing CA label>. Optionally, revoke issued
+certificate <subca label> via <signing CA label>.
+
+Labeling Arguments:
+<subca label> must be supplied on every action usage. It is made up of the
+sub-levels from root and must coincide with the filename of its configuration
+file. So if \$PKICTL_ORG was "sample.org", the root CA is named
+"sample.org-root.ca". A subordinate CA below this one could have the name
+"sub". It would be named "sample.org-sub.root.ca". In this example, the <subca
+label> is "sub" while the <signing CA label> would be "root". A third level
+below that could be named "tls.sub". Its full name would be
+"sample.org-tls.sub.root.ca" and the <subca label> for it would be "tls.sub".
+
+actions:
+    init <subca label>
+            Create folder structure.
+
+    request <subca label>
+            Create private key and certificate request.
+
+    sign <subca label> <signing CA label>
+            Sign <subca label> CSR with private key from <signing CA label> CA.
+
+    gencrl <subca label>
+            Generate initial CRL file.
+
+    genpem <subca label> <signing CA label>
+            Concatenate senior CA <signing CA label> certificate or certificate
+            chain with newly generated <subca label> certificate.
+
+    revoke <subca label> <signing CA label>
+            Revoke issued certificate <subca label> with CA <signing CA label>
+            and automatically generate new CRL for CA <signing CA label>
+EOF
+    exit 1
+}
+
+display_usage_eecert() {
+    cat <<EOF
+Usage: pkictl [<organisation>] eecert <action>
+                              (<request label>|<end entity label>|<export name>)
+                              <signing CA label>
+                              [<output label>|<export name>]
+
+Create an end entity CSR, private key, certificate, and PKCS#12 bundle named
+<output label>, using configuration from <request label>, and sign with
+subordinate CA named <signing CA label>. Later, reference <end entity label> to
+choose what credentials to sign and package. Optionally, revoke issued end
+entity certificate <output label> with CA named <signing CA label> or import
+PKCS#12 bundle named <export name>.
+
+Labeling Arguments:
+<request label> and <signing CA label> must be supplied on every action usage.
+The labeling names are made up of the sub-levels from root and must coincide
+with the filename of its configuration file. So if \$PKICTL_ORG was
+"sample.org", the root CA is named "sample.org-root.ca". A subordinate signing
+CA two levels below could be "tls.sub", its name would be
+"sample.org-tls.sub.root.ca" and its label would be "tls.sub". An end entity
+certificate request could be named "node.tls.sub".  Its full name would be
+"sample.org-node.tls.sub.root.ee". Notice that for end entity certificate
+requests, we change the suffix to "ee" from "ca".  This is to label each as
+"end entity" or "certificate authority" respectively.  To sign this
+configuration, we use "node.tls.sub" as our <request label> and "tls.sub" as
+our <signing CA label>.
+
+actions:
+    request <request label> <signing CA label> <output label>
+            Create private key and certificate request from configuration named
+            <request label> and name it <output label>. The CSR can be found in
+            folder for <signing CA label>. From here on, the end entity
+            key/certificate pair named <output label> will be referenced as
+            <end entity label>. This name cannot change from this point
+            forward.
+
+    sign <end entity label> <signing CA label>
+            Sign the CSR named <end entity label> with private key from
+            <signing CA label> CA.
+
+    genpkcs12 <end entity label> <signing CA label> [<export name>]
+            Package private key and signed certificate from <end entity label>
+            with CA certificate chain from <signing CA label> in a PKCS#12"
+            bundle for export and optionally name it a more friendly name
+            <export name>.
+
+    revoke <end entity label> <signing CA label>
+            Revoke issued certificate <end entity label> with CA <signing CA
+            label> and automatically generate new CRL for <signing CA label>
+            CA.
+
+    import <export name>
+            Take pkcs#12 file <export name> and extract the end entity
+            certificate, private key, and all intermediate CAs and install to
+            configured ssl directory. This automatically will run
+            'update-ca-certificates' after to install the certificates.
+EOF
+    exit 1
+}
+
+##############################################################################
+## Main
+##############################################################################
+
+main() {
+    set -eo pipefail
+
+    # Check if first argument is an existing organisation
+    if ls ${PKICTL_CONFIG_DIR}/$1-* 1> /dev/null 2>&1 ; then
+      export PKICTL_ORG=$1
+      shift 1
+    fi
+
+    # Check action
+    declare opensslOpt=""
+
+    case "$1" in
+        rootca)
+            declare action="$2"
+            rootca "$action"
+            ;;
+        subca)
+            declare action="$2" subCaLabel="$3" signingCaLabel="$4"
+            subca "$action" "$subCaLabel" "$signingCaLabel"
+            ;;
+        eecert)
+            declare action="$2" requestLabel="$3" signingCaLabel="$4" outputLabel="$5"
+            eecert "$action" "$requestLabel" "$signingCaLabel" "$outputLabel"
+            ;;
+        help)
+            display_usage_main
+            ;;
+        *)
+            if [[ -z $1 ]] ; then
+              message=""
+            else
+              message=": '$1'"
+            fi
+            echo "argument error: missing or incorrect subcommand${message}"
+            echo ""
+            display_usage_main
+            ;;
+    esac
+}
+
+##############################################################################
+## Runtime
+##############################################################################
+main "$@"
+
+# vim: tabstop=2 softtabstop=0 expandtab shiftwidth=2 smarttab :

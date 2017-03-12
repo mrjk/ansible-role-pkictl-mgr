@@ -1,0 +1,35 @@
+---
+# tasks file for pkictl-mgr
+
+- name: Config | Generate RootCA configurations
+  template:
+    src: "rootca.ca.conf"
+    dest: "{{ pkictl_config_dir }}/{{ item.org }}-{{ item.name }}.ca.conf"
+  with_items: "{{ rootca }}"
+  tags:
+  - rootca
+  - config_rootca
+
+
+- name: Config | Generate SubCA configurations
+  template:
+    src: "subca.ca.conf"
+    dest: "{{ pkictl_config_dir }}/{{ item.org }}-{{ item.name }}.root.ca.conf"
+  with_items: "{{subca}}"
+  tags:
+  - subca
+  - config_subca
+
+
+- name: Config | Generate EeCert configurations
+  template:
+    src: "eecert.ee.conf"
+    dest: "{{ pkictl_config_dir }}/{{ item.org }}-{{ item.name }}.root.ee.conf"
+  with_items: "{{eecert}}"
+  tags:
+  - config
+  - eecert
+  - config_eecert
+
+
+

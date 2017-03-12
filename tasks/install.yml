@@ -1,0 +1,21 @@
+---
+# tasks file for pkictl-mgr
+# vim: tabstop=2 softtabstop=0 expandtab shiftwidth=2 noautoindent:
+
+
+
+- name: Install | Create destination directories
+  file:
+    dest: "{{ item }}"
+    state: directory
+  with_items: "{{ pkictl_dir_list }}"
+  tags:
+  - setup
+
+  #- name: Install | Install pkictl script
+  #  copy:
+  #    src: pkictl
+  #    dest: "{{ pkictl_bin_path }}"
+  #    mode: 755
+  #  tags:
+  #  - setup

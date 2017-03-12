@@ -1,0 +1,121 @@
+---
+# tasks file for pkictl-mgmt
+
+
+# Root CA Management
+
+- name: RootCA | Init
+  shell: "{{ pkictl_bin }} {{ item.org }} rootca init"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-root.ca/db/{{ item.org }}-root.ca.crt.srl"
+  with_items: "{{ rootca }}"
+  tags:
+  - rootca
+  - mgmt_rootca
+
+- name: RootCA | Request 
+  shell: "{{ pkictl_bin }} {{ item.org }} rootca request"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-root.ca/private/{{ item.org }}-root.ca.key"
+  with_items: "{{ rootca }}"
+  tags:
+  - rootca
+  - mgmt_rootca
+
+- name: RootCA | Sign
+  shell: "{{ pkictl_bin }} {{ item.org }} rootca sign"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-root.ca/{{ item.org }}-root.ca.crt"
+  with_items: "{{ rootca }}"
+  tags:
+  - rootca
+  - mgmt_rootca
+
+
+# Sub CA Management
+
+- name: SubCA | Init
+  shell: "{{ pkictl_bin }} {{ item.org }} subca init {{ item.name }}"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-{{ item.name }}.root.ca/db/{{ item.org }}-{{ item.name }}.root.ca.crt.srl"
+  with_items: "{{ subca }}"
+  tags:
+  - subca
+  - mgmt_subca
+
+
+
+  #- debug: msg="/etc/pkictl/certs/{{ item.org }}-{{ item.name }}.root.ca/{{ item.org }}-{{ item.name }}.root.ca.crt THEN /etc/pkictl/certs/{{ item.org }}-{{ item.name }}.root.ca/{{ item.org }}-{{ item.name }}.root.ca.csr "
+  #  with_items: "{{ subca }}"
+  #  tags:
+  #  - subca
+
+- name: SubCA | Request 
+  shell: "{{ pkictl_bin }} {{ item.org }} subca request {{ item.name }}"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-{{ item.name }}.root.ca/{{ item.org }}-{{ item.name }}.root.ca.crt"
+  with_items: "{{ subca }}"
+  tags:
+  - subca
+  - mgmt_subca
+
+- name: SubCA | Sign
+  shell: "{{ pkictl_bin }} {{ item.org }} subca sign {{ item.name }} {{ item.parent }}"
+  args:
+    chdir: /etc/pkictl/ 
+    removes: "/etc/pkictl/certs/{{ item.org }}-{{ item.name }}.root.ca/{{ item.org }}-{{ item.name }}.root.ca.csr"
+  with_items: "{{ subca }}"
+  tags:
+  - subca
+  - mgmt_subca
+
+- name: SubCA | Generate PEM (Chain)
+  shell: "{{ pkictl_bin }} {{ item.org }} subca genpem {{ item.name }} {{ item.parent }}"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-{{ item.name }}.root.ca/{{ item.org }}-{{ item.name }}.chain.pem"
+  with_items: "{{ subca }}"
+  tags:
+  - subca
+  - mgmt_subca
+
+
+# EeCerts Management
+
+
+  #- debug: msg="/etc/pkictl/certs/{{ item.org }}.root.ca/{{ item.org }}.root.ca.crt"
+  #  with_items: "{{ subca }}"
+  #  tags:
+  #  - subca
+
+
+- name: eeCert | Request
+  shell: "CN='{{ item.name }}' {{ item.env | default() }} {{ pkictl_bin }} {{ item.org }} eecert request {{ item.type }} {{ item.parent }} {{ item.name }}"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-{{ item.parent }}.root.ca/private/{{ item.org }}-{{ item.name }}.root.ee.key"
+  with_items: "{{ eecert_dyn }}"
+  tags:
+  - eecert
+  - mgmt_eecert
+
+
+- name: eeCert | Sign
+  shell: "CN='{{ item.name }}' {{ item.env | default() }} {{ pkictl_bin }} {{ item.org }} eecert sign {{ item.name }} {{ item.parent }}"
+  args:
+    chdir: /etc/pkictl/ 
+    creates: "/etc/pkictl/certs/{{ item.org }}-{{ item.parent }}.root.ca/export/{{ item.org }}-{{ item.name }}.root.ee.crt"
+  with_items: "{{ eecert_dyn }}"
+  tags:
+  - eecert2
+  - eecert
+  - mgmt_eecert
+
+
+
+

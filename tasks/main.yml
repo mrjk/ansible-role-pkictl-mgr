@@ -1,0 +1,13 @@
+---
+# tasks file for pkictl-mgmt
+
+
+# This part takes care of installing pkictl
+- include: install.yml
+
+# This part takes care of creating config files
+- include: config.yml
+
+# This part takes care of generating all certificates
+- include: mgmt.yml
+
