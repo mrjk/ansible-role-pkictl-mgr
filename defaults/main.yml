@@ -78,7 +78,7 @@ presets:
   # Usage: Ask for being CA only
   req_ext_ca: &req_ext_ca
     basicConstraints: "critical,CA:true"
-    keyUsage: digitalSignature,nonRepudiation,keyCertSign,cRLSign
+    keyUsage: critical,keyCertSign,cRLSign
 
   # Usage: Ask for almost anything, except being a CA
   req_ext_anything: &req_ext_anything
@@ -89,8 +89,8 @@ presets:
   # Usage: Ask for SSL Server Auth (Web+Mail servers)
   req_ext_tls_srv: &req_ext_tls_srv
     basicConstraints: "critical,CA:false"
-    keyUsage: digitalSignature,keyAgreement,keyEncipherment
-    extendedKeyUsage: serverAuth
+    keyUsage: critical,digitalSignature,keyEncipherment
+    extendedKeyUsage: serverAuth,clientAuth
 
   # Usage: Ask for SSL Client Auth (Web+Mail client, mail nonRepudiation, code sign, timestamp and symencrypt)
   req_ext_user: &req_ext_user
@@ -151,8 +151,9 @@ presets:
   # Usage: Allow SSL Server Auth (Web+Mail servers)
   sign_ext_tls_srv: &sign_ext_tls_srv
     basicConstraints: "critical,CA:false"
-    keyUsage: digitalSignature,keyAgreement,keyEncipherment
-    extendedKeyUsage: serverAuth
+    keyUsage: critical,digitalSignature,keyEncipherment
+    #keyUsage: critical,digitalSignature,keyAgreement,keyEncipherment
+    extendedKeyUsage: serverAuth,clientAuth
 
   # Usage: Allow SSL Client Auth (Web+Mail client, mail nonRepudiation, code sign, timestamp and symencrypt)
   sign_ext_user: &sign_ext_user
@@ -165,11 +166,26 @@ presets:
 # Default PKI settings
 # =========================================================
 
+eecert_dyn:
+
+  - name: domain1
+    org: myorg
+    parent: domains
+    type: domain_san
+    env: "CN=domain1{{ org.myorg.top_domain }}"
+
+  - name: dom_simple.net
+    org: myorg
+    parent: domains
+    type: domain_san
+    env: "CN=dom-simple.net"
+
+
 
 org:
   myorg:
-    base_url: "http://pki.myorg.192.168.121.114.xip.io"
-    root_domain: ".192.168.121.114.xip.io"
+    base_url: "http://pki.myorg.192-168-121-114.sslip.io"
+    top_domain: ".192-168-121-114.sslip.io"
 
 rootca:
   - name: root
@@ -179,8 +195,8 @@ rootca:
     req_config: *req_conf
     req_dn:
       <<: *req_dn_default
-      organizationalUnitName: myorg L0 CA
-      commonName: myorg/Root CA
+      organizationalUnitName: MyOrg L0 CA
+      commonName: MyOrg/Root CA
     req_ext: *req_ext_ca
 
     # Operation
@@ -199,9 +215,11 @@ subca:
     req_config: *req_conf
     req_dn:
       <<: *req_dn_default
-      organizationalUnitName: myorg L1 SubCA
+      organizationalUnitName: MyOrg L1 SubCA
       commonName: MyOrg/Root/Domains Sub CA
-    req_ext: *req_ext_ca
+    req_ext: 
+      keyUsage: critical,keyCertSign,cRLSign
+      basicConstraints: "critical,CA:true,pathlen:0"
 
     # Operation
     ca_config:
@@ -219,7 +237,7 @@ subca:
     req_config: *req_conf
     req_dn:
       <<: *req_dn_default
-      organizationalUnitName: myorg L1 SubCA
+      organizationalUnitName: MyOrg L1 SubCA
       commonName: MyOrg/Root/OpenVPN Sub CA
     req_ext: *req_ext_ca
 
@@ -240,11 +258,12 @@ eecert:
     req_config: *req_conf
     req_dn:
       <<: *req_dn_default
-      organizationalUnitName: myorg L1 SubCA
-      commonName: MyOrg/Root/Domains Sub CA
-    req_ext: *req_ext_tls_srv
+      organizationalUnitName: MyOrg L2 Certificate
+      commonName: "$ENV::CN"
+    req_ext: 
+      <<: *req_ext_tls_srv
+      subjectAltName: "DNS:$ENV::CN,DNS:*.$ENV::CN"
 
 
-eecert_dyn: []
 
 
